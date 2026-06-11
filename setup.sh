@@ -65,17 +65,24 @@ tempfolder="$(mktemp -d)"
 function cleanup() { rm -rf "$tempfolder"; }
 trap cleanup EXIT
 
-echo "[  3 ] Downloading latest version of battery CLI"
-# Note: github names zips by <reponame>-<branchname>.replace( '/', '-' )
-update_branch="main"
-in_zip_folder_name="battery-$update_branch"
-batteryfolder="$tempfolder/battery"
-rm -rf $batteryfolder
-mkdir -p $batteryfolder
-curl -sSL -o $batteryfolder/repo.zip "https://github.com/actuallymentor/battery/archive/refs/heads/$update_branch.zip"
-unzip -qq $batteryfolder/repo.zip -d $batteryfolder
-cp -r $batteryfolder/$in_zip_folder_name/* $batteryfolder
-rm $batteryfolder/repo.zip
+echo "[  3 ] Locate battery CLI source"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
+if [[ -f "$script_dir/battery.sh" && -f "$script_dir/dist/smc" ]]; then
+	echo "      Using local source from $script_dir"
+	batteryfolder="$script_dir"
+else
+	echo "      Local source not found, downloading latest version"
+	# Note: github names zips by <reponame>-<branchname>.replace( '/', '-' )
+	update_branch="main"
+	in_zip_folder_name="battery-$update_branch"
+	batteryfolder="$tempfolder/battery"
+	rm -rf "$batteryfolder"
+	mkdir -p "$batteryfolder"
+	curl -sSL -o "$batteryfolder/repo.zip" "https://github.com/actuallymentor/battery/archive/refs/heads/$update_branch.zip"
+	unzip -qq "$batteryfolder/repo.zip" -d "$batteryfolder"
+	cp -r "$batteryfolder/$in_zip_folder_name/"* "$batteryfolder"
+	rm "$batteryfolder/repo.zip"
+fi
 
 echo "[  4 ] Make sure $binfolder is recreated and owned by root"
 sudo rm -rf "$binfolder" # start with an empty $binfolder and ensure there is no symlink or file at the path

@@ -4,7 +4,7 @@
 ## Update management
 ## variables are used by this binary as well at the update script
 ## ###############
-BATTERY_CLI_VERSION="v1.3.4"
+BATTERY_CLI_VERSION="v1.3.5"
 
 # If a script may run as root:
 #   - Reset PATH to safe defaults at the very beginning of the script.
@@ -156,10 +156,9 @@ ALL ALL = NOPASSWD: FORCE_DISCHARGE_OFF
 ALL ALL = NOPASSWD: FORCE_DISCHARGE_ON
 ALL ALL = NOPASSWD: LED_CONTROL
 
-# Temporarily keep passwordless SMC reading commands so the old menubar GUI versions don't ask for password on each launch
-# trying to execute 'battery visudo'. There is no harm in removing this, so do it as soon as you believe users are no
-# longer using old versions.
-ALL ALL = NOPASSWD: $smc_binary -k CH0C -r, $smc_binary -k CH0I -r, $smc_binary -k ACLC -r, $smc_binary -k CHIE -r, $smc_binary -k CHTE -r
+# Allow passwordless SMC reads for runtime key probing and status checks.
+Cmnd_Alias    SMC_READ = $smc_binary -k CHTE -r, $smc_binary -k CH0B -r, $smc_binary -k CH0C -r, $smc_binary -k CHIE -r, $smc_binary -k CH0J -r, $smc_binary -k CH0I -r, $smc_binary -k ACLC -r
+ALL ALL = NOPASSWD: SMC_READ
 "
 
 # Get parameters
@@ -218,37 +217,174 @@ function valid_voltage() {
 	return 1
 }
 
-function smc_read_hex() {
-	key=$1
-	line=$(echo $($smc_binary -k $key -r))
-	if [[ $line =~ "no data" ]]; then
+charging_control_keys="CHTE CH0B CH0C"
+adapter_control_keys="CHIE CH0J CH0I"
+
+function smc_output_to_hex() {
+	local line="$1"
+	local value
+	if [[ -z "$line" || "$line" =~ [Nn]o[[:space:]]data || "$line" =~ [Ee]rror || "$line" =~ [Pp]assword || "$line" =~ [Rr]equired || "$line" =~ [Nn]o[[:space:]]such[[:space:]]file || "$line" =~ [Nn]ot[[:space:]]found ]]; then
 		echo
-	else
-		echo ${line#*bytes} | tr -d ' ' | tr -d ')'
+		return
 	fi
+	if [[ "$line" != *bytes* ]]; then
+		echo
+		return
+	fi
+	value="${line#*bytes}"
+	echo "$value" | tr -cd '[:xdigit:]' | tr '[:lower:]' '[:upper:]'
+}
+
+function smc_read_hex_raw() {
+	local key=$1
+	local use_sudo=$2
+	local line
+	if [[ "$use_sudo" == "sudo" ]]; then
+		line="$(sudo -n "$smc_binary" -k "$key" -r 2>&1)"
+	else
+		line="$("$smc_binary" -k "$key" -r 2>&1)"
+	fi
+	smc_output_to_hex "$line"
+}
+
+function smc_read_hex() {
+	local key=$1
+	local value
+	value="$(smc_read_hex_raw "$key")"
+	if [[ -n "$value" ]]; then
+		echo "$value"
+		return
+	fi
+	if [[ $EUID -ne 0 ]]; then
+		smc_read_hex_raw "$key" sudo
+	fi
+}
+
+function hex_values_match() {
+	local observed="$1"
+	local expected="$2"
+	local observed_trim
+	local expected_trim
+	observed_trim="$(echo "$observed" | sed 's/^0*//')"
+	expected_trim="$(echo "$expected" | sed 's/^0*//')"
+	[[ -z "$observed_trim" ]] && observed_trim="0"
+	[[ -z "$expected_trim" ]] && expected_trim="0"
+	[[ "$observed_trim" == "$expected_trim" ]]
 }
 
 function smc_write_hex() {
 	local key=$1
 	local hex_value=$2
-	if ! sudo $smc_binary -k "$key" -w "$hex_value" >/dev/null 2>&1; then
+	if ! sudo "$smc_binary" -k "$key" -w "$hex_value" >/dev/null 2>&1; then
 		log "⚠️ Failed to write $hex_value to $key"
 		return 1
 	fi
 	return 0
 }
 
+function smc_write_hex_verified() {
+	local key=$1
+	local hex_value=$2
+	local readback
+	if ! smc_write_hex "$key" "$hex_value"; then
+		return 1
+	fi
+	readback="$(smc_read_hex "$key")"
+	if [[ -z "$readback" ]]; then
+		log "⚠️ Unable to verify write $hex_value to $key: readback unavailable"
+		return 1
+	fi
+	if ! hex_values_match "$readback" "$hex_value"; then
+		log "⚠️ Failed to verify write $hex_value to $key: read back $readback"
+		return 1
+	fi
+	return 0
+}
+
+function charging_control_value() {
+	local key=$1
+	local state=$2
+	if [[ "$key" == "CHTE" && "$state" == "on" ]]; then echo "00000000"; return; fi
+	if [[ "$key" == "CHTE" && "$state" == "off" ]]; then echo "01000000"; return; fi
+	if [[ "$state" == "on" ]]; then echo "00"; return; fi
+	echo "02"
+}
+
+function adapter_control_value() {
+	local key=$1
+	local state=$2
+	if [[ "$state" == "off" ]]; then echo "00"; return; fi
+	if [[ "$key" == "CHIE" ]]; then echo "08"; return; fi
+	echo "01"
+}
+
 ## #########################
 ## Detect supported SMC keys
 ## #########################
-[[ $($smc_binary -k CHTE -r) =~ "no data" ]] && smc_supports_tahoe=false || smc_supports_tahoe=true;
-[[ $($smc_binary -k CH0B -r) =~ "no data" ]] && smc_supports_legacy=false || smc_supports_legacy=true;
-[[ $($smc_binary -k CHIE -r) =~ "no data" ]] && smc_supports_adapter_chie=false || smc_supports_adapter_chie=true;
-[[ $($smc_binary -k CH0I -r) =~ "no data" ]] && smc_supports_adapter_ch0i=false || smc_supports_adapter_ch0i=true;
-[[ $($smc_binary -k CH0J -r) =~ "no data" || $($smc_binary -k CH0J -r) =~ "Error" ]] && smc_supports_adapter_ch0j=false || smc_supports_adapter_ch0j=true;
+function smc_key_has_data() {
+	[[ -n "$(smc_read_hex "$1")" ]]
+}
+
+smc_key_has_data CHTE && smc_supports_chte=true || smc_supports_chte=false;
+smc_key_has_data CH0B && smc_supports_legacy_ch0b=true || smc_supports_legacy_ch0b=false;
+smc_key_has_data CH0C && smc_supports_legacy_ch0c=true || smc_supports_legacy_ch0c=false;
+[[ "$smc_supports_legacy_ch0b" == "true" || "$smc_supports_legacy_ch0c" == "true" ]] && smc_supports_legacy=true || smc_supports_legacy=false;
+smc_key_has_data CHIE && smc_supports_adapter_chie=true || smc_supports_adapter_chie=false;
+smc_key_has_data CH0I && smc_supports_adapter_ch0i=true || smc_supports_adapter_ch0i=false;
+smc_key_has_data CH0J && smc_supports_adapter_ch0j=true || smc_supports_adapter_ch0j=false;
 
 function log_smc_capabilities() {
-	log "SMC capabilities: tahoe=$smc_supports_tahoe legacy=$smc_supports_legacy CHIE=$smc_supports_adapter_chie CH0I=$smc_supports_adapter_ch0i CH0J=$smc_supports_adapter_ch0j"
+	log "SMC capabilities: CHTE=$smc_supports_chte legacy=$smc_supports_legacy CH0B=$smc_supports_legacy_ch0b CH0C=$smc_supports_legacy_ch0c CHIE=$smc_supports_adapter_chie CH0I=$smc_supports_adapter_ch0i CH0J=$smc_supports_adapter_ch0j"
+}
+
+function supports_charging_control() {
+	[[ "$smc_supports_chte" == "true" || "$smc_supports_legacy" == "true" ]]
+}
+
+function supports_adapter_control() {
+	[[ "$smc_supports_adapter_chie" == "true" || "$smc_supports_adapter_ch0j" == "true" || "$smc_supports_adapter_ch0i" == "true" ]]
+}
+
+function write_charging_control() {
+	local state=$1
+	local key
+	local value
+	local wrote_legacy=false
+	local legacy_failed=false
+
+	if smc_key_has_data CHTE; then
+		value="$(charging_control_value CHTE "$state")"
+		if smc_write_hex_verified CHTE "$value"; then
+			return 0
+		fi
+	fi
+
+	for key in CH0B CH0C; do
+		if smc_key_has_data "$key"; then
+			wrote_legacy=true
+			value="$(charging_control_value "$key" "$state")"
+			if ! smc_write_hex_verified "$key" "$value"; then
+				legacy_failed=true
+			fi
+		fi
+	done
+
+	[[ "$wrote_legacy" == "true" && "$legacy_failed" == "false" ]]
+}
+
+function write_adapter_control() {
+	local state=$1
+	local key
+	local value
+	for key in $adapter_control_keys; do
+		if smc_key_has_data "$key"; then
+			value="$(adapter_control_value "$key" "$state")"
+			if smc_write_hex_verified "$key" "$value"; then
+				return 0
+			fi
+		fi
+	done
+	return 1
 }
 
 ## #################
@@ -279,26 +415,18 @@ function change_magsafe_led_color() {
 # CH0I seems to be the "disable the adapter" key
 function enable_discharging() {
 	log "🔽🪫 Enabling battery discharging"
-	if [[ "$smc_supports_adapter_chie" == "true" ]]; then
-		smc_write_hex CHIE 08
-	elif [[ "$smc_supports_adapter_ch0j" == "true" ]]; then
-		smc_write_hex CH0J 01
-	else
-		smc_write_hex CH0I 01
+	if ! write_adapter_control "on"; then
+		log "⚠️ Unable to determine verified SMC key for enabling battery discharging"
+		return 1
 	fi
 	sudo $smc_binary -k ACLC -w 01
+	return 0
 }
 
 function disable_discharging() {
 	log "🔼🪫 Disabling battery discharging"
-	if [[ "$smc_supports_adapter_chie" == "true" ]]; then
-		smc_write_hex CHIE 00
-	elif [[ "$smc_supports_adapter_ch0j" == "true" ]]; then
-		smc_write_hex CH0J 00
-	elif [[ "$smc_supports_adapter_ch0i" == "true" ]]; then
-		smc_write_hex CH0I 00
-	else
-		smc_write_hex CH0I 00
+	if ! write_adapter_control "off"; then
+		log "⚠️ Unable to determine verified SMC key for disabling battery discharging"
 	fi
 	# Keep track of status
 	is_charging=$(get_smc_charging_status)
@@ -307,12 +435,7 @@ function disable_discharging() {
 
 		log "Disabling discharging: No valid maintain percentage set, enabling charging"
 		# use direct commands since enable_charging also calls disable_discharging, and causes an eternal loop
-		if [[ "$smc_supports_tahoe" == "true" ]]; then
-			smc_write_hex CHTE 00000000
-		elif [[ "$smc_supports_legacy" == "true" ]]; then
-			smc_write_hex CH0B 00
-			smc_write_hex CH0C 00
-		else
+		if ! write_charging_control "on"; then
 			log "⚠️ Unable to reset charging state"
 		fi
 		change_magsafe_led_color "orange"
@@ -327,12 +450,7 @@ function disable_discharging() {
 
 		log "Disabling discharging: Charge below $setting, enabling charging"
 		# use direct commands since enable_charging also calls disable_discharging, and causes an eternal loop
-		if [[ "$smc_supports_tahoe" == "true" ]]; then
-			smc_write_hex CHTE 00000000
-		elif [[ "$smc_supports_legacy" == "true" ]]; then
-			smc_write_hex CH0B 00
-			smc_write_hex CH0C 00
-		else
+		if ! write_charging_control "on"; then
 			log "⚠️ Unable to reset charging state"
 		fi
 		change_magsafe_led_color "orange"
@@ -344,72 +462,61 @@ function disable_discharging() {
 
 # Re:charging, Aldente uses CH0B https://github.com/davidwernhart/AlDente/blob/0abfeafbd2232d16116c0fe5a6fbd0acb6f9826b/AlDente/Helper.swift#L227
 # but @joelucid uses CH0C https://github.com/davidwernhart/AlDente/issues/52#issuecomment-1019933570
-# so I'm using both since with only CH0B I noticed sometimes during sleep it does trigger charging
+# so I'm using both when available since with only CH0B I noticed sometimes during sleep it does trigger charging
 function enable_charging() {
 	log "🔌🔋 Enabling battery charging"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
-		smc_write_hex CHTE 00000000
-	elif [[ "$smc_supports_legacy" == "true" ]]; then
-		smc_write_hex CH0B 00
-		smc_write_hex CH0C 00
-	else
+	local charging_control_ok=true
+	if ! write_charging_control "on"; then
 		log "⚠️ Unable to determine SMC keys for enabling charging"
+		charging_control_ok=false
 	fi
 	disable_discharging
+	[[ "$charging_control_ok" == "true" ]]
 }
 
 function disable_charging() {
 	log "🔌🪫 Disabling battery charging"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
-		smc_write_hex CHTE 01000000
-	elif [[ "$smc_supports_legacy" == "true" ]]; then
-		smc_write_hex CH0B 02
-		smc_write_hex CH0C 02
-	else
+	if ! write_charging_control "off"; then
 		log "⚠️ Unable to determine SMC keys for disabling charging"
+		return 1
 	fi
+	return 0
 }
 
 function get_smc_charging_status() {
-	local status_key="CH0B"
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
-		status_key="CHTE"
-	fi
-	hex_status=$(smc_read_hex "$status_key")
-	if [[ -z "$hex_status" ]]; then
-		echo "unknown"
-		return
-	fi
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
-		if [[ "$hex_status" == "00000000" ]]; then
-			echo "enabled"
-		else
-			echo "disabled"
+	local key
+	local hex_status
+	for key in $charging_control_keys; do
+		hex_status=$(smc_read_hex "$key")
+		if [[ -z "$hex_status" ]]; then
+			continue
 		fi
-	elif [[ "$hex_status" == "00" ]]; then
-		echo "enabled"
-	else
+		if hex_values_match "$hex_status" "$(charging_control_value "$key" "on")"; then
+			echo "enabled"
+			return
+		fi
 		echo "disabled"
-	fi
+		return
+	done
+	get_system_charging_status
 }
 
 function get_smc_discharging_status() {
-	local status_key="CH0I"
-	if [[ "$smc_supports_adapter_chie" == "true" ]]; then
-		status_key="CHIE"
-	elif [[ "$smc_supports_adapter_ch0j" == "true" ]]; then
-		status_key="CH0J"
-	fi
-	hex_status=$(smc_read_hex "$status_key")
-	if [[ -z "$hex_status" ]]; then
-		echo "unknown"
-		return
-	fi
-	if [[ "$hex_status" == "0" || "$hex_status" == "00" ]]; then
-		echo "not discharging"
-	else
+	local key
+	local hex_status
+	for key in $adapter_control_keys; do
+		hex_status=$(smc_read_hex "$key")
+		if [[ -z "$hex_status" ]]; then
+			continue
+		fi
+		if hex_values_match "$hex_status" "$(adapter_control_value "$key" "off")"; then
+			echo "not discharging"
+			return
+		fi
 		echo "discharging"
-	fi
+		return
+	done
+	get_system_discharging_status
 }
 
 ## ###############
@@ -426,8 +533,69 @@ function get_remaining_time() {
 	echo "$time_remaining"
 }
 
+function get_pmset_output() {
+	pmset -g batt 2>/dev/null
+}
+
+function get_pmset_battery_line() {
+	get_pmset_output | tail -n1
+}
+
+function get_system_charging_status() {
+	local battery_line
+	local profiler_power
+	battery_line="$(get_pmset_battery_line)"
+	if [[ "$battery_line" =~ [Dd]ischarging ]]; then
+		echo "disabled"
+		return
+	fi
+	if [[ "$battery_line" =~ [Cc]harging || "$battery_line" =~ [Cc]harged ]]; then
+		echo "enabled"
+		return
+	fi
+
+	profiler_power="$(system_profiler SPPowerDataType 2>/dev/null)"
+	if [[ "$profiler_power" =~ "Charging: Yes" ]]; then
+		echo "enabled"
+		return
+	fi
+	if [[ "$profiler_power" =~ "Charging: No" ]]; then
+		echo "disabled"
+		return
+	fi
+	echo "unknown"
+}
+
+function get_system_discharging_status() {
+	local battery_line
+	local profiler_power
+	battery_line="$(get_pmset_battery_line)"
+	if [[ "$battery_line" =~ [Dd]ischarging ]]; then
+		echo "discharging"
+		return
+	fi
+	if [[ "$battery_line" =~ [Cc]harging || "$battery_line" =~ [Cc]harged ]]; then
+		echo "not discharging"
+		return
+	fi
+
+	profiler_power="$(system_profiler SPPowerDataType 2>/dev/null)"
+	if [[ "$profiler_power" =~ "Charging: No" ]]; then
+		echo "discharging"
+		return
+	fi
+	if [[ "$profiler_power" =~ "Charging: Yes" ]]; then
+		echo "not discharging"
+		return
+	fi
+	echo "unknown"
+}
+
 function get_charger_state() {
-	ac_attached=$(pmset -g batt | tail -n1 | awk '{ x=match($0, /AC attached/) > 0; print x }')
+	ac_attached=$(get_pmset_output | awk 'NR == 1 { x=match($0, /AC Power/) > 0; print x; exit }')
+	if [[ -z "$ac_attached" || "$ac_attached" == "0" ]]; then
+		ac_attached=$(get_pmset_battery_line | awk '{ x=match($0, /AC attached/) > 0; print x }')
+	fi
 	echo "$ac_attached"
 }
 
@@ -952,18 +1120,38 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 		is_charging=$(get_smc_charging_status)
 		ac_attached=$(get_charger_state)
 
-		if [[ "$battery_percentage" -ge "$upper_bound" && ("$is_charging" == "enabled" || "$ac_attached" == "1") ]]; then
+		is_discharging=$(get_smc_discharging_status)
+
+		if [[ "$battery_percentage" -ge "$upper_bound" && ("$is_charging" == "enabled" || "$ac_attached" == "1" || "$is_discharging" == "not discharging") ]]; then
 
 			log "Charge at or above $upper_bound%"
-			if [[ "$is_charging" == "enabled" ]]; then
-				disable_charging
+			if supports_charging_control && [[ "$is_charging" != "disabled" ]]; then
+				if ! disable_charging && supports_adapter_control && [[ "$is_discharging" != "discharging" ]]; then
+					log "Charging control failed verification, forcing adapter discharge"
+					enable_discharging
+				fi
+			elif supports_adapter_control && [[ "$is_discharging" != "discharging" ]]; then
+				log "Charging control unavailable, forcing adapter discharge"
+				enable_discharging
+			elif ! supports_charging_control && ! supports_adapter_control; then
+				log "⚠️ Unable to determine SMC keys for limiting battery level"
 			fi
 			change_magsafe_led_color "green"
 
-		elif [[ "$battery_percentage" -lt "$lower_bound" && "$is_charging" == "disabled" ]]; then
+		elif [[ "$battery_percentage" -lt "$lower_bound" && ("$is_charging" != "enabled" || "$is_discharging" == "discharging") ]]; then
 
 			log "Charge below $lower_bound%"
-			enable_charging
+			if supports_charging_control; then
+				if ! enable_charging && supports_adapter_control; then
+					log "Charging control failed verification, restoring adapter power"
+					disable_discharging
+				fi
+			elif supports_adapter_control; then
+				log "Charging control unavailable, restoring adapter power"
+				disable_discharging
+			else
+				log "⚠️ Unable to determine SMC keys for restoring charging"
+			fi
 			change_magsafe_led_color "orange"
 
 		fi
@@ -1008,14 +1196,35 @@ if [[ "$action" == "maintain_voltage_synchronous" ]]; then
 	# Loop
 	while true; do
 		is_charging=$(get_smc_charging_status)
+		is_discharging=$(get_smc_discharging_status)
 
-		if (($(echo "$voltage < $lower_voltage" | bc -l))) && [[ "$is_charging" == "disabled" ]]; then
+		if (($(echo "$voltage < $lower_voltage" | bc -l))) && [[ "$is_charging" != "enabled" || "$is_discharging" == "discharging" ]]; then
 			log "Battery at ${voltage}V"
-			enable_charging
+			if supports_charging_control; then
+				if ! enable_charging && supports_adapter_control; then
+					log "Charging control failed verification, restoring adapter power"
+					disable_discharging
+				fi
+			elif supports_adapter_control; then
+				log "Charging control unavailable, restoring adapter power"
+				disable_discharging
+			else
+				log "⚠️ Unable to determine SMC keys for restoring charging"
+			fi
 		fi
-		if (($(echo "$voltage >= $upper_voltage" | bc -l))) && [[ "$is_charging" == "enabled" ]]; then
+		if (($(echo "$voltage >= $upper_voltage" | bc -l))) && [[ "$is_charging" != "disabled" || "$is_discharging" == "not discharging" ]]; then
 			log "Battery at ${voltage}V"
-			disable_charging
+			if supports_charging_control; then
+				if ! disable_charging && supports_adapter_control; then
+					log "Charging control failed verification, forcing adapter discharge"
+					enable_discharging
+				fi
+			elif supports_adapter_control; then
+				log "Charging control unavailable, forcing adapter discharge"
+				enable_discharging
+			else
+				log "⚠️ Unable to determine SMC keys for limiting battery voltage"
+			fi
 		fi
 
 		sleep 60
@@ -1178,7 +1387,9 @@ fi
 # Status logger
 if [[ "$action" == "status" ]]; then
 
-	log "Battery at $(get_battery_percentage)% ($(get_remaining_time) remaining), $(get_voltage)V, smc charging $(get_smc_charging_status)"
+	smc_charging_status=$(get_smc_charging_status)
+	smc_discharging_status=$(get_smc_discharging_status)
+	log "Battery at $(get_battery_percentage)% ($(get_remaining_time) remaining), $(get_voltage)V, smc charging $smc_charging_status, adapter $smc_discharging_status"
 	if test -f $pidfile; then
 		maintain_percentage=$(cat $maintain_percentage_tracker_file 2>/dev/null)
 		if [[ $maintain_percentage ]]; then
